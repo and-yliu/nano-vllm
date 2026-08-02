@@ -3,8 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from vllm.utils.context import get_context
+
+# turning tokens to embeddings
 class VocabParallelEmbedding(nn.Module):
     def __init__(self, num_embedding: int, embedding_dim: int):
+        super().__init__()
         self.tp_size = dist.get_world_size()
         self.tp_rank = dist.get_rank()
 
@@ -29,7 +33,7 @@ class VocabParallelEmbedding(nn.Module):
         # making sure that the range does not consider padding
         actual_start = min(offset, self.num_embedding)
         actual_end = min(offset + shard_size, self.num_embedding)
-        actual_shard_size = min(0, actual_end - actual_start)
+        actual_shard_size = max(0, actual_end - actual_start)
 
         if actual_shard_size > 0:
             loaded_weight = loaded_weight.narrow(0, actual_start, actual_shard_size)
@@ -55,3 +59,35 @@ class VocabParallelEmbedding(nn.Module):
 
         return output
 
+# the last step to turn model output into logits for vocab
+class ParallelLMHead(VocabParallelEmbedding):
+    def __init__(self, num_embedding: int, embedding_dim: int):
+        super().__init__(num_embedding, embedding_dim)
+
+    # x: [batch_size, seq_len, hidden_size]
+    # weight: [vocab_size_per_partition, hidden_size]
+    def forward(self, x: torch.Tensor):
+        context = get_context()
+        # in prefill many prompt token may be packed together, lgoits are for the final token of each prompt
+        if context.is_prefill:
+            # context.cu_seqlens_q = [0, 3, 5, 9]
+            # last_token = [2, 4, 8]
+            last_token = context.cu_seqlens_q[1:] - 1
+            x = x[last_token].contiguous()
+
+        # logits: [batch_size, seq_len, vocab_size_per_partition]
+        # F.linear automatically transpose the weight
+        logits = F.linear(x, self.weight)
+        if self.tp_size > 1:
+            # gpu 0 will hold copy of all logics from other gpus
+            all_logits = [torch.empty(logits.size(), device=logits.device) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
+            # collect logits from other gpu to gpu 0
+            dist.gather(logits, gather_list=all_logits, dst=0)
+            if self.tp_rank == 0:
+                # concatenate logits
+                # logits: [batch_size, seq_len, vocab_size]
+                logits = torch.cat(all_logits, dim=-1)
+                # trim to origignal size, ... means keep everything form all dimesions before the final one
+                logits = logits[..., :self.num_embedding]
+
+        return logits
