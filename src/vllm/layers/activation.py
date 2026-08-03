@@ -46,7 +46,7 @@ if __name__ == "__main__":
         cur = time.time()
         output_tensor = layer(input_tensor)
         torch.cuda.synchronize()
-        times.append(cur - time.time())
+        times.append(time.time() - cur)
 
     avg_time = sum(times) / len(times)
     print(f"Average compliation time = {avg_time * 1000:.3f} ms")

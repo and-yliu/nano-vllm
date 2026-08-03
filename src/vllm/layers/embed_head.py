@@ -54,7 +54,7 @@ class VocabParallelEmbedding(nn.Module):
 
         if self.tp_size > 1:
             # clear values for token not in this gpu
-            output = output * mask.unsqueeze_(1)
+            output = output * mask.unsqueeze(-1)
             dist.all_reduce(output, op=dist.ReduceOp.SUM)
 
         return output

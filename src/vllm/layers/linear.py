@@ -24,10 +24,10 @@ class BaseLinear(nn.Module):
 
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        return NotImplementedError
+        raise NotImplementedError
 
     def forward(self, x: torch.Tensor):
-        return NotImplementedError
+        raise NotImplementedError
 
 
 # most simple linear transformation
@@ -153,7 +153,7 @@ class RowParalleleLinear(BaseLinear):
 
         assert shard_size == param_data.size(self.tp_dim)
 
-        loaded_weight = loaded_weight(self.tp_dim, start_index, shard_size)
+        loaded_weight = loaded_weight.narrow(self.tp_dim, start_index, shard_size)
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

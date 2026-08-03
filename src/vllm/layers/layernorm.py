@@ -34,7 +34,7 @@ class RMSNorm(nn.Module):
         return self.rms_forward(x)
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
-        if residual:
+        if residual is not None:
             return self.residual_rms_forward(x, residual)
         else:
             return self.rms_forward(x)
@@ -56,7 +56,7 @@ if __name__ == "__main__":
         start = time.time()
         _ = layer(x)
         torch.cuda.synchronize()
-        times.append(start - time.time())
+        times.append(time.time() - start)
 
     avg_time = sum(times) / len(times)
     print(f"Without Residual: {avg_time * 1000:.3f} ms")
@@ -68,7 +68,7 @@ if __name__ == "__main__":
         start = time.time()
         _ = layer(x, residual)
         torch.cuda.synchronize()
-        times.append(start - time.time())
+        times.append(time.time() - start)
 
     avg_time = sum(times) / len(times)
     print(f"With Residual: {avg_time * 1000:.3f} ms")
