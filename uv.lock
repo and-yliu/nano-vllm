@@ -291,12 +291,14 @@ source = { editable = "." }
 dependencies = [
     { name = "torch" },
     { name = "transformers" },
+    { name = "triton" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "torch" },
     { name = "transformers" },
+    { name = "triton" },
 ]
 
 [[package]]
