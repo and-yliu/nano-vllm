@@ -182,10 +182,86 @@ def flash_attention_varlen_kernel(
     # write output to HBM
     tl.store(o_ptr, acc.to(o.dtype.element_ty), mask=mask_q[:, None])
 
-        
+
+@triton.jit
+def paged_attention_decode_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    output_ptr,
+    block_tables_ptr,
+    context_lens_ptr,
+    num_q_head: tl.constexpr,
+    num_kv_head: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    scale: tl.constexpr,
+    max_block_size: tl.constexpr,
+    BLOCK_N: tl.constexpr
+):
+    block_index = tl.program_id(0)
+    head_index = tl.program_id(1)
+
+    # determine which kv head index is used for this query (for GQA)
+    kv_head_idx = head_index // (num_q_head // num_kv_head)
+
+    # load q
+    q_dim_offset = tl.arange(0, head_dim)
+    q_offset = block_index * num_q_head * head_dim + head_index * head_dim + q_dim_offset
+    q = tl.load(q_ptr + q_offset)
+
+    # length of the current sequence length of the block
+    context_lens = tl.load(context_lens_ptr + block_index)
+
+    max_chunk = tl.cdiv(max_block_size * block_size, BLOCK_N)
+
+    for chunk_index in range(max_chunk):
+        start = chunk_index * BLOCK_N 
+
+        if start < context_lens:
+            kv_dim = start + tl.arange(0, BLOCK_N) 
+            mask_kv = kv_dim < context_lens
+            logical_dim = kv_dim // block_size
+            logical_offset = kv_dim % block_size
+
+            physical_dim = block_tables_ptr + block_index * max_block_size + logical_dim + logical_offset
+            
 
 
 
+    
 
-        
+def paged_attention_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    num_q_head: int,
+    num_kv_head: int,
+    head_dim: int,
+    block_size: int,
+    scale: float
+):
+    batch_size = q.shape[0]
+    max_num_blocks = block_tables.shape[1]
 
+    q = q.contiguous()
+    output = torch.empty_like(q)
+
+    if head_dim <= 128:
+        BLOCK_N = 64
+    else:
+        BLOCK_N = 32
+
+    grid = (batch_size, num_q_head)
+
+    paged_attention_decode_kernel[grid](
+        q, k_cache, v_cache, output, 
+        block_tables, context_lens,
+        num_q_head=num_q_head, num_kv_head=num_kv_head, head_dim=head_dim,
+        block_size=block_size, scale=scale, max_block_size=max_num_blocks,
+        BLOCK_N=BLOCK_N
+    )
+
+    return output
