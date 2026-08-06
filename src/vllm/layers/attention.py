@@ -208,25 +208,116 @@ def paged_attention_decode_kernel(
     # load q
     q_dim_offset = tl.arange(0, head_dim)
     q_offset = block_index * num_q_head * head_dim + head_index * head_dim + q_dim_offset
-    q = tl.load(q_ptr + q_offset)
+    q = tl.load(q_ptr + q_offset)      #(head_dim)
 
     # length of the current sequence length of the block
     context_lens = tl.load(context_lens_ptr + block_index)
 
+    # offset for getting all values of one token's one head
+    offset_d = tl.arange(0, head_dim)
+
     max_chunk = tl.cdiv(max_block_size * block_size, BLOCK_N)
+
+    max = -1e10
+    sum = 0
+    acc = tl.zeros((head_dim,), dtype=tl.float32)
+
 
     for chunk_index in range(max_chunk):
         start = chunk_index * BLOCK_N 
 
         if start < context_lens:
             kv_dim = start + tl.arange(0, BLOCK_N) 
-            mask_kv = kv_dim < context_lens
-            logical_dim = kv_dim // block_size
-            logical_offset = kv_dim % block_size
 
-            physical_dim = block_tables_ptr + block_index * max_block_size + logical_dim + logical_offset
-            
+            qk = tl.zeros((BLOCK_N,), dtype=tl.float32) - 1e10
 
+            block_table_num = kv_dim // block_size
+            block_offset = kv_dim % block_size
+
+            in_range = (kv_dim < context_lens) & (block_table_num < max_block_size)
+
+            block_table_index_ptr = block_tables_ptr + block_index * max_block_size + block_table_num
+            block_table_offset = tl.load(block_table_index_ptr, mask=in_range, other=-1)
+
+            valid = in_range & (block_table_offset != -1)
+
+            block_table_offset = tl.where(valid, block_table_offset, 0).to(tl.int64)
+
+            cache_offset = (
+                block_table_offset[None, :] * block_size * num_kv_head * head_dim +     #(1, BLOCK_N)
+                block_offset[None, :] * num_kv_head * head_dim +                        #(1, BLOCK_N)
+                kv_head_idx * head_dim +                                                 #(1)
+                offset_d[:, None]                                                       #(head_dim, 1)
+            )
+
+            k_cache = tl.load(k_cache_ptr + cache_offset, mask=valid[None, :], other=0.0) # (head_dim, BLOCK_N)
+            k_cache = tl.cast(k_cache, tl.float32)
+            qk = tl.dot(q[None, :], k_cache)[0] * scale      #(1, BLOCK_N)
+            qk = tl.where(valid, qk, -1e10) 
+        
+            # for i in range(BLOCK_N):
+            #     token_index = start + i
+
+            #     if token_index < context_lens:
+            #         block_num = token_index // block_size
+            #         block_offset = token_index % block_size
+
+            #         block_table_index_ptr = block_tables_ptr + block_index * max_block_size + block_num
+            #         block_table_offset = tl.load(block_table_index_ptr) 
+
+            #         if block_table_offset != -1:
+            #             k_cache_offset = block_table_offset * block_size * num_kv_head * head_dim + block_offset * num_kv_head * head_dim + kv_head_idx * head_dim
+            #             k_cache_dim = k_cache_offset + offset_d
+            #             k_cache = tl.load(k_cache_ptr + k_cache_dim)
+
+            #             score = tl.sum(q * k_cache) * scale
+
+            #             mask_i = tl.arange(0, BLOCK_N) == i
+            #             qk = tl.where(mask_i, score, qk)
+
+            current_max = tl.max(qk)            
+            max_new = tl.maximum(current_max, max)
+            alpha = tl.exp(max - max_new)
+            p = tl.exp(qk - max_new)
+
+            acc = acc * alpha
+            sum = sum * alpha
+
+            v_cache = tl.load(v_cache_ptr + cache_offset, mask=valid[None, :], other=0.0) #(head_dim, BLOCK_N)
+            v_cache = tl.cast(v_cache, tl.float32)
+
+            weight = tl.where(valid, p, 0.0) # (BLOCK_N)
+
+            acc = acc + tl.dot(weight[None, :], tl.trans(v_cache))[0]
+            sum = sum + tl.sum(weight)
+
+            # for i in range(BLOCK_N):
+            #     token_index = start + i
+
+            #     if token_index < context_lens:
+            #         block_num = token_index // block_size
+            #         block_offset = token_index % block_size
+
+            #         block_table_index_ptr = block_tables_ptr + block_index * max_block_size + block_num
+            #         block_table_offset = tl.load(block_table_index_ptr) 
+
+            #         if block_table_offset != -1:
+            #             v_cache_offset = block_table_offset * block_size * num_kv_head * head_dim + block_offset * num_kv_head * head_dim + kv_head_idx * head_dim
+            #             v_cache_dim = v_cache_offset + offset_d
+            #             v_cache = tl.load(v_cache_ptr + v_cache_dim)
+
+            #             mask_i = tl.arange(0, BLOCK_N) == i
+            #             weight = tl.sum(tl.where(mask_i, p, 0.0))
+
+            #             acc = acc + weight * v_cache
+            #             sum = sum + weight
+
+            max = max_new
+
+    output = acc / sum
+
+    output_offset = block_index * num_q_head * head_dim + head_index * head_dim + offset_d
+    tl.store(output_ptr+output_offset, output)
 
 
     
