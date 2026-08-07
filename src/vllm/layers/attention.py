@@ -6,6 +6,8 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
+from vllm.utils.context import get_context
+
 
 def prefill_flash_attention(
     q: torch.Tensor,
@@ -198,7 +200,8 @@ def paged_attention_decode_kernel(
     scale: tl.constexpr,
     max_block_size: tl.constexpr,
     BLOCK_N: tl.constexpr
-):
+):  
+    # grid vlaue
     block_index = tl.program_id(0)
     head_index = tl.program_id(1)
 
@@ -216,8 +219,10 @@ def paged_attention_decode_kernel(
     # offset for getting all values of one token's one head
     offset_d = tl.arange(0, head_dim)
 
+    # number of loop to load all kv_block to SRAM
     max_chunk = tl.cdiv(max_block_size * block_size, BLOCK_N)
 
+    # online softmax variables
     max = -1e10
     sum = 0
     acc = tl.zeros((head_dim,), dtype=tl.float32)
@@ -227,22 +232,30 @@ def paged_attention_decode_kernel(
         start = chunk_index * BLOCK_N 
 
         if start < context_lens:
+            # start index of each token in the sequence
             kv_dim = start + tl.arange(0, BLOCK_N) 
 
+            # placeholder of qk
             qk = tl.zeros((BLOCK_N,), dtype=tl.float32) - 1e10
 
+            # logically which page/block does the tokens belong to within the sequence  
             block_table_num = kv_dim // block_size
+            # what is the offset from the start of the page/block
             block_offset = kv_dim % block_size
 
+            # check if any token is outside of the sequence
             in_range = (kv_dim < context_lens) & (block_table_num < max_block_size)
 
+            # where is the physical position of the kv_cache from the block_table
             block_table_index_ptr = block_tables_ptr + block_index * max_block_size + block_table_num
             block_table_offset = tl.load(block_table_index_ptr, mask=in_range, other=-1)
 
+            # discard if any block that does not show position, use 0 as a place holder 
             valid = in_range & (block_table_offset != -1)
-
             block_table_offset = tl.where(valid, block_table_offset, 0).to(tl.int64)
 
+            # cache shape: (num_blocks, block_size, num_kv_heads, head_dim)
+            # where is the current block, block_offset, head
             cache_offset = (
                 block_table_offset[None, :] * block_size * num_kv_head * head_dim +     #(1, BLOCK_N)
                 block_offset[None, :] * num_kv_head * head_dim +                        #(1, BLOCK_N)
@@ -250,8 +263,11 @@ def paged_attention_decode_kernel(
                 offset_d[:, None]                                                       #(head_dim, 1)
             )
 
+            # load k_cache
             k_cache = tl.load(k_cache_ptr + cache_offset, mask=valid[None, :], other=0.0) # (head_dim, BLOCK_N)
             k_cache = tl.cast(k_cache, tl.float32)
+
+            # calculate qk
             qk = tl.dot(q[None, :], k_cache)[0] * scale      #(1, BLOCK_N)
             qk = tl.where(valid, qk, -1e10) 
         
@@ -275,19 +291,22 @@ def paged_attention_decode_kernel(
             #             mask_i = tl.arange(0, BLOCK_N) == i
             #             qk = tl.where(mask_i, score, qk)
 
+            # online soft mask calculation
             current_max = tl.max(qk)            
             max_new = tl.maximum(current_max, max)
             alpha = tl.exp(max - max_new)
             p = tl.exp(qk - max_new)
 
+            # Rescale accumulator
             acc = acc * alpha
             sum = sum * alpha
 
+            # obtain v_cache from the same offset because kv cache share the same shape
             v_cache = tl.load(v_cache_ptr + cache_offset, mask=valid[None, :], other=0.0) #(head_dim, BLOCK_N)
             v_cache = tl.cast(v_cache, tl.float32)
 
+            # accumulate new values
             weight = tl.where(valid, p, 0.0) # (BLOCK_N)
-
             acc = acc + tl.dot(weight[None, :], tl.trans(v_cache))[0]
             sum = sum + tl.sum(weight)
 
@@ -313,15 +332,14 @@ def paged_attention_decode_kernel(
             #             sum = sum + weight
 
             max = max_new
-
+    # final rescale
     output = acc / sum
 
+    # load result to output
     output_offset = block_index * num_q_head * head_dim + head_index * head_dim + offset_d
     tl.store(output_ptr+output_offset, output)
 
-
     
-
 def paged_attention_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -356,3 +374,122 @@ def paged_attention_decode(
     )
 
     return output
+
+def save_kv_cache(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int
+):
+    # shape of the k
+    token_num, num_kv_head, head_dim = k.shape
+
+    # make kv continguous
+    k = k.contiguous()
+    v = v.contiguous()
+
+    # make sure k and v have the same shape and slot mapping have the same number of token
+    assert k.shape == v.shape
+    assert slot_mapping.numel() == token_num
+
+    # how to parallel the work
+    grid = (token_num, num_kv_head)
+
+    save_kv_cache_kernel[grid](
+        k, v, k_cache, v_cache,
+        slot_mapping,
+        head_dim=head_dim,
+        num_kv_head=num_kv_head,
+    )
+
+@triton.jit
+def save_kv_cache_kernel(
+    k_ptr,
+    v_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    slot_mapping_ptr,
+    head_dim: tl.constexpr,
+    num_kv_head: tl.constexpr,
+):  
+    # get grid parameters
+    token_index = tl.program_id(0)
+    head_index = tl.program_id(1)
+
+    offset_d = tl.arange(0, head_dim)
+
+    # which slot in physical memory should the cache be stored
+    slot_index = tl.load(slot_mapping_ptr + token_index)
+
+    if slot_index == -1:
+        return
+
+    # load k and v
+    offset = token_index * num_kv_head * head_dim + head_index * head_dim + offset_d
+    k = tl.load(k_ptr + offset)
+    v = tl.load(v_ptr + offset)
+
+    # store k and v into the phsyical memory
+    cache_offset = slot_index * num_kv_head * head_dim + head_index * head_dim + offset_d
+    tl.store(k_cache_ptr + cache_offset, k)
+    tl.store(v_cache_ptr + cache_offset, v)
+
+class Attention(nn.Module):
+    def __init__(
+        self, 
+        num_q_head: int,
+        head_dim: int, 
+        scale: float = 1.0,
+        num_kv_head: int = None, 
+        block_size: int = 16
+    ):
+        super().__init__()
+        self.num_q_head = num_q_head
+        self.head_dim = head_dim
+        self.scale = scale
+        self.num_kv_head = num_kv_head if num_kv_head is not None else num_q_head
+        self.block_size = block_size
+        self.k_cache = self.v_cache = torch.Tensor([])
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        context = get_context()
+
+        # store kv_cache if  k_cache and v_cache is intialized
+        if self.k_cache.numel() > 0 and self.v_cache.numel() > 0 and context.slot_mapping is not None:
+            #Ensure k and v have the right shape
+            if k.dim() == 4:  #(batch, token, head, head_dim)
+                batch, token, head, head_dim = k.shape
+                k = k.reshape(batch*token, head, head_dim)
+                v = v.reshape(batch*token, head, head_dim)
+            else:
+                k = k.contiguous()
+                v = v.contiguous()
+
+            save_kv_cache(k, v, self.k_cache, self.v_cache, context.slot_mapping, block_size=self.block_size)
+
+        scale = self.scale / self.head_dim ** 0.5
+
+        if context.is_prefill:
+            # prefill use flash attention
+            cu_seqlens = context.cu_seqlens_q
+            if cu_seqlens is None:
+                raise ValueError("cu_seqlens_q are needed for multiple sequences flash attention")
+            
+            # output shape: (token, head, head_dim)
+            output = prefill_flash_attention(q, k, v, cu_seqlens, self.num_q_head, self.num_kv_head, self.head_dim, scale)
+            # combine results from multiple heads
+            return output.reshape(output.shape[0], self.num_q_head * self.head_dim)
+        else:
+            # decode use paged attention
+            block_table = context.block_tables
+            context_lens = context.context_lens
+
+            if block_table is None or context_lens is None:
+                raise ValueError("block_table and context_lens are needed for paged attention")
+            
+            #output shape: (batch, head, head_dim)
+            output = paged_attention_decode(q, self.k_cache, self.v_cache, block_table, context_lens, self.num_q_head, self.num_kv_head, self.head_dim, self.block_size, scale)
+            # combine results from multiple heads
+            return output.reshape(output.shape[0], self.num_q_head * self.head_dim)
