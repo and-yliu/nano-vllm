@@ -6,7 +6,7 @@ import time
 # RMS(x) = sqrt(sum(x^2)/len(x) + eps)
 # RMSNorm(x) = x / RMS(x) ⊙ gamma
 # RMSNorm keeps the activation magnitude within a more predictable range, which helps gradients flow through deep Transformer layers.
-# The idea is to Keep the direction and relative feature values, but control the overall magnitude.
+# The idea is to keep the direction and relative feature values, but control the overall magnitude.
 # Usually used in pre-norm
 
 #LayerNorm performs both re-centering and re-scaling.
@@ -28,12 +28,12 @@ class RMSNorm(nn.Module):
         rms = variance.sqrt()
         return x / rms * self.weight
 
-    def residual_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor: 
+    def residual_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: 
         # residual help avoid diminishing gradient, perserve information
         x = x + residual
-        return self.rms_forward(x)
+        return self.rms_forward(x), residual
 
-    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None)-> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is not None:
             return self.residual_rms_forward(x, residual)
         else:
