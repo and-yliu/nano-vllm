@@ -3,15 +3,17 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from vllm.utils.distributed import get_rank, get_world_size
+
 class BaseLinear(nn.Module):
     def __init__(self, input_size: int, output_size: int, bias: bool = False, tp_dim: int | None = None ):
         super().__init__()
         # 0 for column, 1 for row
         self.tp_dim = tp_dim
         # the rank(numbering) of the gpu
-        self.tp_rank = dist.get_rank()
+        self.tp_rank = get_rank()
         # total number of gpu
-        self.tp_size = dist.get_world_size()
+        self.tp_size = get_world_size()
 
         self.weight = nn.Parameter(torch.empty((output_size, input_size)))
         self.weight.weight_loader = self.weight_loader
@@ -44,7 +46,7 @@ class ReplicatedLinear(BaseLinear):
 
 class ColumnParallelLinear(BaseLinear):
     def __init__(self, input_size: int, output_size: int, bias: bool = False):
-        tp_size = dist.get_world_size()
+        tp_size = get_world_size()
         super().__init__(input_size, output_size // tp_size, bias, 0)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -92,7 +94,7 @@ class QKVMergedColumnParallelLinear(ColumnParallelLinear):
         num_kv_heads: int | None = None,
         bias: bool = False
     ):
-        self.tp_size = dist.get_world_size()
+        self.tp_size = get_world_size()
         num_kv_heads = num_kv_heads or num_heads
         self.head_size = head_size
         # Number of heads for one gpu
@@ -132,14 +134,14 @@ class QKVMergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight = loaded_weight.narrow(self.tp_dim, loaded_weight_start_index, shard_size)
         param_data.copy_(loaded_weight)
 
-class RowParalleleLinear(BaseLinear):
+class RowParallelLinear(BaseLinear):
     def __init__(
         self,
         input_size: int,
         output_size: int,
         bias: bool = False
     ):
-        self.tp_size = dist.get_world_size()
+        self.tp_size = get_world_size()
         assert output_size % self.tp_size == 0
         super().__init__(input_size // self.tp_size, output_size, bias, tp_dim=1)
 

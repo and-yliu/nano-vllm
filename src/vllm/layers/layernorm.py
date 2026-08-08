@@ -31,7 +31,7 @@ class RMSNorm(nn.Module):
     def residual_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: 
         # residual help avoid diminishing gradient, perserve information
         x = x + residual
-        return self.rms_forward(x), residual
+        return self.rms_forward(x), x
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None)-> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is not None:

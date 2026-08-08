@@ -1,14 +1,14 @@
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 from transformers import Qwen3Config
 
-from vllm.layers.linear import QKVMergedColumnParallelLinear, RowParalleleLinear, MergeColumnParallelLinear
+from vllm.layers.linear import QKVMergedColumnParallelLinear, RowParallelLinear, MergeColumnParallelLinear
 from vllm.layers.attention import Attention
 from vllm.layers.activation import SiluAndMul
 from vllm.layers.layernorm import RMSNorm
 from vllm.layers.rope import RotaryEmbedding
 from vllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from vllm.utils.distributed import get_world_size
 
 
 class Qwen3Attention(nn.Module):
@@ -25,7 +25,7 @@ class Qwen3Attention(nn.Module):
         block_size: int = 256
     ):
         super().__init__()
-        self.tp_size = dist.get_world_size()
+        self.tp_size = get_world_size()
 
         # num_head is per GPU
         self.total_num_heads = num_head
@@ -51,7 +51,7 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.head_dim * self.num_kv_heads
         self.qkv_bias = qkv_bias
 
-        self.row_linear = RowParalleleLinear(
+        self.row_linear = RowParallelLinear(
             input_size=self.head_dim * self.total_num_heads,
             output_size=hidden_size
         )
@@ -116,10 +116,10 @@ class Qwen3MLP(nn.Module):
         self.activation = SiluAndMul()
         self.gate_up = MergeColumnParallelLinear(
             input_size=hidden_size,
-            output_size=intermediate_size * 2,
+            output_size=[intermediate_size, intermediate_size],
             bias = bias
         )
-        self.down_proj = RowParalleleLinear(
+        self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
             output_size=hidden_size,
             bias = bias
