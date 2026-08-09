@@ -51,14 +51,14 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.head_dim * self.num_kv_heads
         self.qkv_bias = qkv_bias
 
-        self.row_linear = RowParallelLinear(
+        self.o_proj = RowParallelLinear(
             input_size=self.head_dim * self.total_num_heads,
             output_size=hidden_size
         )
 
         self.rotary_embedding = RotaryEmbedding(base=base, embed_dim=self.head_dim, max_position=max_position)
-        self.q_rms_norm = RMSNorm(torch.ones(head_dim), rms_norm_eps)
-        self.k_rms_norm = RMSNorm(torch.ones(head_dim), rms_norm_eps)
+        self.q_norm = RMSNorm(torch.ones(head_dim), rms_norm_eps)
+        self.k_norm = RMSNorm(torch.ones(head_dim), rms_norm_eps)
 
         self.attention = Attention(
             head_dim=self.head_dim,
@@ -91,8 +91,8 @@ class Qwen3Attention(nn.Module):
 
         # apply rms_norm nor to Q and K which is used in attention weight multiplication
         # It helps to avoid big numbers that cause softmax instability
-        q = self.q_rms_norm(q)
-        k = self.k_rms_norm(k)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # add position information to q and k
         q, k = self.rotary_embedding(positions, q, k)
@@ -102,7 +102,7 @@ class Qwen3Attention(nn.Module):
 
         # gathering all (batch*token num_heads * head_dim) sharded across all GPU
         # output sahpe (batch*token, hidden_size = (self.total_num_heads * self.head_dim))
-        return self.row_linear(output)
+        return self.o_proj(output)
 
 
 class Qwen3MLP(nn.Module):
@@ -133,7 +133,7 @@ class Qwen3MLP(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     def __init__(self, config: Qwen3Config):
         super().__init__()
-        self.attention = Qwen3Attention(
+        self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_head=config.num_attention_heads,
             head_dim=config.head_dim,
@@ -141,6 +141,7 @@ class Qwen3DecoderLayer(nn.Module):
             max_position=config.max_position_embeddings,
             qkv_bias=config.attention_bias,
             rms_norm_eps=config.rms_norm_eps,
+            base=config.rope_theta 
         )
 
         self.mlp = Qwen3MLP(
@@ -149,12 +150,12 @@ class Qwen3DecoderLayer(nn.Module):
             bias=False
         )
 
-        self.pre_norm = RMSNorm(
+        self.input_layernorm = RMSNorm(
             gamma=torch.ones(config.hidden_size),
             eps=config.rms_norm_eps
         )
 
-        self.post_attention_norm = RMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             gamma=torch.ones(config.hidden_size),
             eps=config.rms_norm_eps
         )
@@ -162,9 +163,9 @@ class Qwen3DecoderLayer(nn.Module):
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         # normalized and check if residual is given
         if residual is None:
-            hidden_states, residual = self.pre_norm(hidden_states), hidden_states
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
-            hidden_states, residual = self.pre_norm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         from vllm.utils.context import get_context
         # get positions of hidden_states
@@ -184,8 +185,8 @@ class Qwen3DecoderLayer(nn.Module):
             # decoding just the last token
             positions = context.context_lens - 1
 
-        hidden_states = self.attention(positions, hidden_states)
-        hidden_states, residual = self.post_attention_norm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
@@ -193,33 +194,41 @@ class Qwen3DecoderLayer(nn.Module):
 class Qwen3Model(nn.Module):
     def __init__(self, config: Qwen3Config):
         super().__init__()
-        self.embedding = VocabParallelEmbedding(
+        self.embed_tokens = VocabParallelEmbedding(
             num_embedding=config.vocab_size,
             embedding_dim=config.hidden_size
         )
-        self.decoder_layers = nn.ModuleList(
+        self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(
                 config=config
             ) for _ in range(config.num_hidden_layers)]
         )
-        self.rms_norm = RMSNorm(
+        self.norm = RMSNorm(
             gamma=torch.ones(config.hidden_size),
             eps=config.rms_norm_eps
         )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         # turn tokens into embedding 
-        x = self.embedding(token_ids)
+        x = self.embed_tokens(token_ids)
         # run it through each decoder layer
         residual = None
-        for layer in self.decoder_layers:
+        for layer in self.layers:
             x, residual = layer(x, residual)
 
         # nomalize the final output
-        output, _ = self.rms_norm(x, residual)
+        output, _ = self.norm(x, residual)
         return output
 
 class Qwen3ForCausalLM(nn.Module):
+    packed_modules_mapping = {
+        "q_proj":    ("qkv_linear", "q"),
+        "k_proj":    ("qkv_linear", "k"),
+        "v_proj":    ("qkv_linear", "v"),
+        "gate_proj": ("gate_up", 0),
+        "up_proj":   ("gate_up", 1),
+    }
+
     def __init__(self, config: Qwen3Config):
         super().__init__()
         self.model = Qwen3Model(config)
@@ -229,7 +238,7 @@ class Qwen3ForCausalLM(nn.Module):
         )
         # using the same weight matrix for converting input token to embedding and convert hidden states back to vocab logits
         if config.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.embedding.weight.data
+            self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     # run the model, by giving the token_ids
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:

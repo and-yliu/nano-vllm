@@ -224,7 +224,7 @@ def paged_attention_decode_kernel(
 
     # online softmax variables
     max = -1e10
-    sum = 0
+    sum = 0.0
     acc = tl.zeros((head_dim,), dtype=tl.float32)
 
 
@@ -265,10 +265,9 @@ def paged_attention_decode_kernel(
 
             # load k_cache
             k_cache = tl.load(k_cache_ptr + cache_offset, mask=valid[None, :], other=0.0) # (head_dim, BLOCK_N)
-            k_cache = tl.cast(k_cache, tl.float32)
 
-            # calculate qk
-            qk = tl.dot(q[None, :], k_cache)[0] * scale      #(1, BLOCK_N)
+            # calculate qk for single-token decode
+            qk = tl.sum(q[:, None] * k_cache, axis=0) * scale      #(BLOCK_N)
             qk = tl.where(valid, qk, -1e10) 
         
             # for i in range(BLOCK_N):
@@ -303,11 +302,10 @@ def paged_attention_decode_kernel(
 
             # obtain v_cache from the same offset because kv cache share the same shape
             v_cache = tl.load(v_cache_ptr + cache_offset, mask=valid[None, :], other=0.0) #(head_dim, BLOCK_N)
-            v_cache = tl.cast(v_cache, tl.float32)
 
             # accumulate new values
             weight = tl.where(valid, p, 0.0) # (BLOCK_N)
-            acc = acc + tl.dot(weight[None, :], tl.trans(v_cache))[0]
+            acc = acc + tl.sum(weight[None, :] * v_cache, axis=1)
             sum = sum + tl.sum(weight)
 
             # for i in range(BLOCK_N):

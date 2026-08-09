@@ -149,11 +149,11 @@ class RowParallelLinear(BaseLinear):
         param_data = param.data
 
         # weight size per GPU
-        shard_size = loaded_weight.size(self.tp_dim) 
+        shard_size = param_data.size(self.tp_dim)
         # start index of the loaded weights
         start_index = self.tp_rank * shard_size
 
-        assert shard_size == param_data.size(self.tp_dim)
+        assert shard_size * self.tp_size == loaded_weight.size(self.tp_dim)
 
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_index, shard_size)
         param_data.copy_(loaded_weight)
