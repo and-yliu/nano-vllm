@@ -130,6 +130,12 @@ class Qwen3MLP(nn.Module):
         x = self.activation(x)
         return self.down_proj(x)
 
+def get_rope_theta(config: Qwen3Config, default: float = 10000.0) -> float:
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters and "rope_theta" in rope_parameters:
+        return rope_parameters["rope_theta"]
+    return getattr(config, "rope_theta", default)
+
 class Qwen3DecoderLayer(nn.Module):
     def __init__(self, config: Qwen3Config):
         super().__init__()
@@ -141,7 +147,7 @@ class Qwen3DecoderLayer(nn.Module):
             max_position=config.max_position_embeddings,
             qkv_bias=config.attention_bias,
             rms_norm_eps=config.rms_norm_eps,
-            base=config.rope_theta 
+            base=get_rope_theta(config),
         )
 
         self.mlp = Qwen3MLP(

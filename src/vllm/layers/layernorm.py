@@ -24,9 +24,14 @@ class RMSNorm(nn.Module):
         return self.weight
 
     def rms_forward(self, x: torch.Tensor) -> torch.Tensor:
+        # The variance must be accumulated in fp32. In fp16, overflows
+        # once |x| > 256 In bf16 it does not overflow but loses ~0.2% per call, which is
+        # enough to drift greedy decoding.
+        input_dtype = x.dtype
+        x = x.float()
         variance = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
-        rms = variance.sqrt()
-        return x / rms * self.weight
+        x = x * torch.rsqrt(variance)
+        return self.weight * x.to(input_dtype)
 
     def residual_rms_forward(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]: 
         # residual help avoid diminishing gradient, perserve information

@@ -45,7 +45,10 @@ class TestQwen3Parity(unittest.TestCase):
 
         cls.path = snapshot_download(MODEL_ID)
         cls.device = torch.device("cuda")
-        cls.dtype = torch.bfloat16
+        # bf16 needs Ampere (sm_80+). On older cards (T4 = sm_75) it is emulated,
+        # slower, and less accurate than fp16, so prefer fp16 there.
+        major, _ = torch.cuda.get_device_capability()
+        cls.dtype = torch.bfloat16 if major >= 8 else torch.float16
 
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.path)
         cls.config = Qwen3Config.from_pretrained(cls.path)
