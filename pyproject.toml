@@ -10,7 +10,8 @@ requires-python = ">=3.11,<3.12"
 dependencies = [
     "transformers",
     "torch",
-    "triton"
+    "xxhash",
+    "triton",
 ]
 
 [tool.setuptools.packages.find]

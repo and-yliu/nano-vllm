@@ -1,15 +1,3 @@
-"""End-to-end parity against HuggingFace on real Qwen3-0.6B weights.
-
-This is the ground-truth test for the loader and the prefill path: it asserts
-that this implementation produces the same logits, and the same greedy tokens,
-as `transformers` on the same prompt.
-
-Requires CUDA (the attention kernels are Triton) and downloads ~1.5GB on first
-run into the HuggingFace cache.
-
-    python -m unittest tests.test_parity -v
-"""
-
 from pathlib import Path
 import sys
 import unittest

@@ -148,6 +148,7 @@ class Qwen3DecoderLayer(nn.Module):
             qkv_bias=config.attention_bias,
             rms_norm_eps=config.rms_norm_eps,
             base=get_rope_theta(config),
+            block_size=getattr(config, "block_size", 256),
         )
 
         self.mlp = Qwen3MLP(
