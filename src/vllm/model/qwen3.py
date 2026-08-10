@@ -167,30 +167,18 @@ class Qwen3DecoderLayer(nn.Module):
             eps=config.rms_norm_eps
         )
 
-    def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # normalized and check if residual is given
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        from vllm.utils.context import get_context
-        # get positions of hidden_states
-        context = get_context()
-        #  when prefill, get postion for all token in the sequence
-        if context.is_prefill and context.cu_seqlens_q is not None:
-            positions = []
-            cu_seqlens = context.cu_seqlens_q.cpu().tolist()
-            for i in range(len(cu_seqlens) - 1):
-                seqlen = cu_seqlens[i+1] - cu_seqlens[i]
-                positions += range(seqlen)
-            positions = torch.tensor(positions, dtype=torch.long, device=hidden_states.device)
-        elif context.is_prefill:
-            # rotate all previous tokens
-            positions = torch.arange(hidden_states.size(0), device=hidden_states.device)
-        else: 
-            # decoding just the last token
-            positions = context.context_lens - 1
 
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -215,13 +203,51 @@ class Qwen3Model(nn.Module):
             eps=config.rms_norm_eps
         )
 
+    def _build_positions(self, hidden_states: torch.Tensor) -> torch.Tensor:
+
+        from vllm.utils.context import get_context
+
+        context = get_context()
+
+        #  when prefill, get postion for all token in the sequence
+        if context.is_prefill and context.cu_seqlens_q is not None:
+            positions = []
+            cu_seqlens = context.cu_seqlens_q.cpu().tolist()
+            # With a cached prefix this pass only holds the uncached suffix, but
+            # RoPE encodes absolute position -- so the first token of the pass is
+            # at num_cached, not 0. cu_seqlens_k spans the whole context, so the
+            # difference between the two spans is exactly what is already cached.
+            cu_seqlens_k = (
+                context.cu_seqlens_k.cpu().tolist()
+                if context.cu_seqlens_k is not None
+                else None
+            )
+            for i in range(len(cu_seqlens) - 1):
+                seqlen = cu_seqlens[i+1] - cu_seqlens[i]
+                num_cached = (
+                    (cu_seqlens_k[i+1] - cu_seqlens_k[i]) - seqlen
+                    if cu_seqlens_k is not None
+                    else 0
+                )
+                positions += range(num_cached, num_cached + seqlen)
+            return torch.tensor(positions, dtype=torch.long, device=hidden_states.device)
+
+        if context.is_prefill:
+            # rotate all previous tokens
+            return torch.arange(hidden_states.size(0), device=hidden_states.device)
+
+        # decoding just the last token
+        return context.context_lens - 1
+
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        # turn tokens into embedding 
+        # turn tokens into embedding
         x = self.embed_tokens(token_ids)
+        # positions depend only on the context, so build them once for all layers
+        positions = self._build_positions(x)
         # run it through each decoder layer
         residual = None
         for layer in self.layers:
-            x, residual = layer(x, residual)
+            x, residual = layer(positions, x, residual)
 
         # nomalize the final output
         output, _ = self.norm(x, residual)

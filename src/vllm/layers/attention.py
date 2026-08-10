@@ -17,7 +17,8 @@ def prefill_flash_attention(
     num_q_head: int,
     num_kv_head: int,
     head_dim: int,
-    scale: float
+    scale: float,
+    max_seqlen: int | None = None,
 ) -> torch.Tensor:
     # make tensor contiguous for faster access
     q = q.contiguous()
@@ -42,9 +43,11 @@ def prefill_flash_attention(
     # number of sequences
     num_seq = cu_seqlens.size(0) - 1
 
-    # geting the max seqlen
-    cu_seqlens_cpu = cu_seqlens.cpu()
-    max_seqlen = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).max().item()
+    # geting the max seqlen -- prefer the caller's host-side value, since reading
+    # cu_seqlens off the device syncs and this runs once per layer
+    if max_seqlen is None:
+        cu_seqlens_cpu = cu_seqlens.cpu()
+        max_seqlen = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).max().item()
 
     # split the calculation different grid and launch all kernel.
     grid = (triton.cdiv(max_seqlen, BLOCK_M), num_q_head, num_seq)
@@ -183,6 +186,210 @@ def flash_attention_varlen_kernel(
 
     # write output to HBM
     tl.store(o_ptr, acc.to(o.dtype.element_ty), mask=mask_q[:, None])
+
+# paged prefill (prefill_flash_attention with the K/V loads swapped for block-table gathers)
+def paged_prefill_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    block_tables: torch.Tensor,
+    num_q_head: int,
+    num_kv_head: int,
+    head_dim: int,
+    block_size: int,
+    scale: float,
+    max_seqlen_q: int | None = None,
+) -> torch.Tensor:
+    
+    q = q.contiguous()
+    output = torch.empty_like(q)
+
+    if head_dim <= 64:
+        BLOCK_M = BLOCK_N = 64
+    elif head_dim <= 128:
+        BLOCK_M = BLOCK_N = 32
+    else:
+        BLOCK_M = BLOCK_N = 16
+
+    num_seq = cu_seqlens_q.size(0) - 1
+    assert cu_seqlens_k.size(0) == cu_seqlens_q.size(0), (
+        "cu_seqlens_q and cu_seqlens_k must describe the same number of sequences"
+    )
+
+    if max_seqlen_q is None:
+        cu_seqlens_q_cpu = cu_seqlens_q.cpu()
+        q_lens = cu_seqlens_q_cpu[1:] - cu_seqlens_q_cpu[:-1]
+        max_seqlen_q = q_lens.max().item()
+
+        # num_cached = k_len - q_len is computed per sequence inside the kernel
+        # and drives both the causal mask and RoPE. A key span shorter than its
+        # query span makes it negative, corrupting both silently. Only checked
+        # on this path, since it is the one already paying for a sync.
+        cu_seqlens_k_cpu = cu_seqlens_k.cpu()
+        k_lens = cu_seqlens_k_cpu[1:] - cu_seqlens_k_cpu[:-1]
+        assert bool((k_lens >= q_lens).all()), (
+            f"key span must cover the query span per sequence, got q={q_lens.tolist()} "
+            f"k={k_lens.tolist()}"
+        )
+
+    grid = (triton.cdiv(max_seqlen_q, BLOCK_M), num_q_head, num_seq)
+
+    paged_prefill_attention_kernel[grid](
+        q, k_cache, v_cache, output,
+        cu_seqlens_q, cu_seqlens_k, block_tables,
+        scale,
+        num_q_head=num_q_head,
+        num_kv_head=num_kv_head,
+        head_dim=head_dim,
+        block_size=block_size,
+        max_block_size=block_tables.shape[1],
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+    )
+
+    return output
+
+
+@triton.jit
+def paged_prefill_attention_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    o_ptr,
+    cu_seqlens_q_ptr,
+    cu_seqlens_k_ptr,
+    block_tables_ptr,
+    scale,
+    num_q_head: tl.constexpr,
+    num_kv_head: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    max_block_size: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # corresponding to the grid above
+    block_index = tl.program_id(0)
+    head_index = tl.program_id(1)
+    seq_index = tl.program_id(2)
+
+    # determine which kv head index is used for this query (for GQA)
+    kv_head_idx = head_index // (num_q_head // num_kv_head)
+
+    # queries packed varlen, exactly as in the contiguous prefill kernel
+    q_start = tl.load(cu_seqlens_q_ptr + seq_index)
+    q_end = tl.load(cu_seqlens_q_ptr + seq_index + 1)
+    q_len = q_end - q_start
+
+    # keys span the whole context: cached prefix plus the tokens of this pass
+    k_start = tl.load(cu_seqlens_k_ptr + seq_index)
+    k_end = tl.load(cu_seqlens_k_ptr + seq_index + 1)
+    k_len = k_end - k_start
+
+    # if current processing token is larger than q_len, skip
+    if block_index * BLOCK_M >= q_len:
+        return
+
+    # the cached prefix sits before this pass's tokens, so query i in this pass
+    # is at absolute position num_cached + i. This is the offset that both the
+    # causal mask and (in qwen3) RoPE have to agree on.
+    num_cached = k_len - q_len
+
+    # offset for getting all values of one token's one head
+    offset_d = tl.arange(0, head_dim)
+    # token positions in relation to the start of this pass's queries
+    offset_q = block_index * BLOCK_M + tl.arange(0, BLOCK_M)
+    # ... and the same tokens as absolute positions in the full sequence
+    q_position = num_cached + offset_q
+
+    q_offset = (
+        (q_start + offset_q[:, None]) * num_q_head * head_dim
+        + head_index * head_dim
+        + offset_d[None, :]
+    )
+    mask_q = offset_q < q_len
+    q = tl.load(q_ptr + q_offset, mask=mask_q[:, None], other=0.0)
+
+    # Initialize output accumulators
+    sum = tl.zeros([BLOCK_M], dtype=tl.float32)
+    max = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10
+    acc = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32)
+
+    # walk the entire context, not just this pass's tokens
+    num_blocks = tl.cdiv(k_len, BLOCK_N)
+
+    for block_n in range(num_blocks):
+        # absolute key positions within the sequence
+        offset_kv = block_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        # logically which page does each key belong to, and where inside it
+        block_table_num = offset_kv // block_size
+        block_offset = offset_kv % block_size
+
+        in_range = (offset_kv < k_len) & (block_table_num < max_block_size)
+
+        # where is the physical position of the kv_cache from the block_table
+        block_table_index_ptr = block_tables_ptr + seq_index * max_block_size + block_table_num
+        block_table_offset = tl.load(block_table_index_ptr, mask=in_range, other=-1)
+
+        # discard if any block that does not show position, use 0 as a place holder
+        valid = in_range & (block_table_offset != -1)
+        block_table_offset = tl.where(valid, block_table_offset, 0).to(tl.int64)
+
+        # cache shape: (num_blocks, block_size, num_kv_heads, head_dim)
+        # K is loaded transposed, (head_dim, BLOCK_N), ready for tl.dot
+        k_cache_offset = (
+            block_table_offset[None, :] * block_size * num_kv_head * head_dim +
+            block_offset[None, :] * num_kv_head * head_dim +
+            kv_head_idx * head_dim +
+            offset_d[:, None]
+        )
+        k_block = tl.load(k_cache_ptr + k_cache_offset, mask=valid[None, :], other=0.0)
+
+        qk = tl.dot(q, k_block)   # (BLOCK_M, BLOCK_N)
+        qk = qk * scale
+
+        # causal in absolute positions: a query may see the whole cached prefix
+        # plus the earlier tokens of this pass, but nothing after itself
+        mask_casual = q_position[:, None] >= offset_kv[None, :]
+        qk = tl.where(mask_casual & valid[None, :], qk, -1e10)
+
+        # online softmax update
+        current_max = tl.max(qk, axis=1)
+        max_new = tl.maximum(current_max, max)
+        alpha = tl.exp(max - max_new)
+        p = tl.exp(qk - max_new[:, None])
+
+        # used to scale previous value of V
+        acc = acc * alpha[:, None]
+
+        # V is loaded untransposed, (BLOCK_N, head_dim)
+        v_cache_offset = (
+            block_table_offset[:, None] * block_size * num_kv_head * head_dim +
+            block_offset[:, None] * num_kv_head * head_dim +
+            kv_head_idx * head_dim +
+            offset_d[None, :]
+        )
+        v_block = tl.load(v_cache_ptr + v_cache_offset, mask=valid[:, None], other=0.0)
+
+        # add current result to previous results
+        acc = acc + tl.dot(p.to(v_block.dtype), v_block)
+
+        # update the denominator for softmax
+        sum = sum * alpha + tl.sum(p, axis=1)
+        max = max_new
+
+    # finalize final result after division
+    acc = acc / sum[:, None]
+
+    o_offset = (
+        (q_start + offset_q[:, None]) * num_q_head * head_dim
+        + head_index * head_dim
+        + offset_d[None, :]
+    )
+    tl.store(o_ptr + o_offset, acc.to(o_ptr.dtype.element_ty), mask=mask_q[:, None])
 
 
 @triton.jit
@@ -474,9 +681,34 @@ class Attention(nn.Module):
             cu_seqlens = context.cu_seqlens_q
             if cu_seqlens is None:
                 raise ValueError("cu_seqlens_q are needed for multiple sequences flash attention")
-            
-            # output shape: (token, head, head_dim)
-            output = prefill_flash_attention(q, k, v, cu_seqlens, self.num_q_head, self.num_kv_head, self.head_dim, scale)
+
+            # A cached prefix means the keys this pass needs are not the ones it
+            # computed, so attention has to read them back out of the cache. The
+            # kv cache write above already put this pass's K/V there.
+            use_paged = (
+                self.k_cache.numel() > 0
+                and context.block_tables is not None
+                and context.cu_seqlens_k is not None
+                and context.slot_mapping is not None
+            )
+
+            if use_paged:
+                # output shape: (token, head, head_dim)
+                output = paged_prefill_attention(
+                    q, self.k_cache, self.v_cache,
+                    cu_seqlens, context.cu_seqlens_k, context.block_tables,
+                    self.num_q_head, self.num_kv_head, self.head_dim,
+                    self.block_size, scale,
+                    # host-side already, so the wrapper needs no device read
+                    max_seqlen_q=context.max_seqlen_q or None,
+                )
+            else:
+                # no cache (or nothing cached yet): keys are this pass's own
+                # output shape: (token, head, head_dim)
+                output = prefill_flash_attention(
+                    q, k, v, cu_seqlens, self.num_q_head, self.num_kv_head,
+                    self.head_dim, scale, max_seqlen=context.max_seqlen_q or None,
+                )
             # combine results from multiple heads
             return output.reshape(output.shape[0], self.num_q_head * self.head_dim)
         else:
