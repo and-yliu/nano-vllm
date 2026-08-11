@@ -30,9 +30,16 @@ class Sequence:
 
         self.status = SequenceStatus.WAITING
         self.num_cached_tokens = 0
+        self.num_scheduled_tokens = 0
         self.block_table: list[int] = []
         # number of token per block
         self.block_size = block_size
+
+    def __len__(self):
+        return self.num_tokens
+
+    def __getitem__(self, key):
+        return self.token_ids[key]
 
     @property
     def is_finished(self) -> bool:

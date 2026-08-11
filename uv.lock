@@ -291,6 +291,7 @@ source = { editable = "." }
 dependencies = [
     { name = "torch" },
     { name = "transformers" },
+    { name = "triton" },
     { name = "xxhash" },
 ]
 
@@ -298,6 +299,7 @@ dependencies = [
 requires-dist = [
     { name = "torch" },
     { name = "transformers" },
+    { name = "triton" },
     { name = "xxhash" },
 ]
 
