@@ -111,9 +111,6 @@ class BlockManager:
                 h = -1
             seq.block_table.append(block_id)
 
-        # Always leave at least one token for the forward pass to compute.
-        seq.num_cached_tokens = min(num_cached_blocks * self.block_size, seq.num_tokens - 1)
-
     # called when a sequence is on FINISHED
     def deallocate(self, seq: Sequence) -> None:
         # update block information

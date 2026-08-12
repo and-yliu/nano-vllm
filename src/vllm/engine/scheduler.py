@@ -7,6 +7,7 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()                                          # arrival order
         self.running: deque[Sequence] = deque()                                          # currently holding blocks
         self.block_manager: BlockManager = BlockManager(max_cached_blocks, block_size)
+        self.block_size: int = block_size                                                # tokens per KV block
         self.max_num_seqs: int = max_num_seqs                                            # batch width cap
         self.max_num_batched_tokens: int = max_num_batched_tokens                        # prefill work cap per step
         self.eos_token_id: int = eos
@@ -51,10 +52,12 @@ class Scheduler:
 
             # determine if all token is scheduled before starting to run the sequence
             seq.num_scheduled_tokens = min(num_tokens, remaining)
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.block_size:
+            num_batched_tokens += seq.num_scheduled_tokens
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
+                scheduled_seqs.append(seq)
 
         if scheduled_seqs:
             return scheduled_seqs, True
