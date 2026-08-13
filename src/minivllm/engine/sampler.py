@@ -1,6 +1,6 @@
 import torch
 
-from vllm.engine.sequence import Sequence
+from minivllm.engine.sequence import Sequence
 
 
 @torch.inference_mode()

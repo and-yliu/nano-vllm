@@ -2,7 +2,7 @@ import xxhash
 import numpy as np
 from collections import deque
 
-from vllm.engine.sequence import Sequence
+from minivllm.engine.sequence import Sequence
 
 class Block:
     def __init__(self, block_id):
@@ -98,6 +98,10 @@ class BlockManager:
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
+            # A hit block already holds valid K/V, so the runner must not
+            # recompute it. Without this the prefix cache still shares blocks
+            # but every token is prefilled again, i.e. no speedup at all.
+            seq.num_cached_tokens += self.block_size
 
         # for not cached block, allocate new blocks at set their hash and tokens
         for i in range(num_cached_blocks, seq.num_blocks):

@@ -8,8 +8,8 @@ from transformers import Qwen3Config
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from vllm.model.qwen3 import Qwen3ForCausalLM
-from vllm.utils.context import reset_context, set_context
+from minivllm.model.qwen3 import Qwen3ForCausalLM
+from minivllm.utils.context import reset_context, set_context
 
 
 def init_debug_weights(model: torch.nn.Module) -> None:

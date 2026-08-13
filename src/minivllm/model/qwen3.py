@@ -2,13 +2,13 @@ import torch
 import torch.nn as nn
 from transformers import Qwen3Config
 
-from vllm.layers.linear import QKVMergedColumnParallelLinear, RowParallelLinear, MergeColumnParallelLinear
-from vllm.layers.attention import Attention
-from vllm.layers.activation import SiluAndMul
-from vllm.layers.layernorm import RMSNorm
-from vllm.layers.rope import RotaryEmbedding
-from vllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-from vllm.utils.distributed import get_world_size
+from minivllm.layers.linear import QKVMergedColumnParallelLinear, RowParallelLinear, MergeColumnParallelLinear
+from minivllm.layers.attention import Attention
+from minivllm.layers.activation import SiluAndMul
+from minivllm.layers.layernorm import RMSNorm
+from minivllm.layers.rope import RotaryEmbedding
+from minivllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from minivllm.utils.distributed import get_world_size
 
 
 class Qwen3Attention(nn.Module):
@@ -205,7 +205,7 @@ class Qwen3Model(nn.Module):
 
     def _build_positions(self, hidden_states: torch.Tensor) -> torch.Tensor:
 
-        from vllm.utils.context import get_context
+        from minivllm.utils.context import get_context
 
         context = get_context()
 

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from vllm.utils.distributed import get_rank, get_world_size
+from minivllm.utils.distributed import get_rank, get_world_size
 
 class BaseLinear(nn.Module):
     def __init__(self, input_size: int, output_size: int, bias: bool = False, tp_dim: int | None = None ):

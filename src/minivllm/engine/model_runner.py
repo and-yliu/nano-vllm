@@ -1,12 +1,12 @@
 import torch
 from transformers import Qwen3Config
 
-from vllm.engine.sequence import Sequence
-from vllm.layers.attention import Attention
-from vllm.model.qwen3 import Qwen3ForCausalLM
-from vllm.engine.sampler import sample
-from vllm.utils.context import set_context, reset_context
-from vllm.utils.loader import load_model
+from minivllm.engine.sequence import Sequence
+from minivllm.layers.attention import Attention
+from minivllm.model.qwen3 import Qwen3ForCausalLM
+from minivllm.engine.sampler import sample
+from minivllm.utils.context import set_context, reset_context
+from minivllm.utils.loader import load_model
 
 
 class ModelRunner:

@@ -43,7 +43,7 @@ def reference_prefill_attention(
 class PrefillAttentionTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA and Triton")
     def test_prefill_flash_attention_matches_pytorch_reference(self) -> None:
-        from vllm.layers.attention import prefill_flash_attention
+        from minivllm.layers.attention import prefill_flash_attention
 
         torch.manual_seed(0)
         device = torch.device("cuda")

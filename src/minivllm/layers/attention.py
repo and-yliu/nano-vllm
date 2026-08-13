@@ -6,7 +6,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-from vllm.utils.context import get_context
+from minivllm.utils.context import get_context
 
 
 def prefill_flash_attention(

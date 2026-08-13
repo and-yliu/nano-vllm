@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from vllm.utils.context import get_context
-from vllm.utils.distributed import get_rank, get_world_size
+from minivllm.utils.context import get_context
+from minivllm.utils.distributed import get_rank, get_world_size
 
 # turning tokens to embeddings
 class VocabParallelEmbedding(nn.Module):

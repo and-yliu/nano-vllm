@@ -71,7 +71,7 @@ def reference_paged_attention_decode(
 class PagedAttentionDecodeTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA and Triton")
     def test_paged_attention_decode_matches_pytorch_reference(self) -> None:
-        from vllm.layers.attention import paged_attention_decode
+        from minivllm.layers.attention import paged_attention_decode
 
         torch.manual_seed(0)
         device = torch.device("cuda")

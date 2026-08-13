@@ -28,8 +28,8 @@ class TestQwen3Parity(unittest.TestCase):
         from huggingface_hub import snapshot_download
         from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3Config
 
-        from vllm.model.qwen3 import Qwen3ForCausalLM
-        from vllm.utils.loader import load_model
+        from minivllm.model.qwen3 import Qwen3ForCausalLM
+        from minivllm.utils.loader import load_model
 
         cls.path = snapshot_download(MODEL_ID)
         cls.device = torch.device("cuda")
@@ -60,7 +60,7 @@ class TestQwen3Parity(unittest.TestCase):
 
     def _ours_last_logits(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Logits for the final token of a single prompt: [vocab]."""
-        from vllm.utils.context import reset_context, set_context
+        from minivllm.utils.context import reset_context, set_context
 
         cu_seqlens_q = torch.tensor(
             [0, token_ids.numel()], dtype=torch.int32, device=self.device
@@ -161,7 +161,7 @@ class TestQwen3Parity(unittest.TestCase):
         Called only when an assertion has already failed, to point at the
         offending layer instead of leaving a bare logit diff.
         """
-        from vllm.utils.context import reset_context, set_context
+        from minivllm.utils.context import reset_context, set_context
 
         ours_out, ref_out = {}, {}
 

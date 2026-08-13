@@ -1,7 +1,7 @@
 from enum import Enum, auto
 import math
 from itertools import count 
-from vllm.sampling_params import SamplingParams
+from minivllm.sampling_params import SamplingParams
 from copy import copy
 
 class SequenceStatus(Enum):

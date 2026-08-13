@@ -14,8 +14,8 @@ DEFAULT_PROMPT = "The capital of France is"
 def build(path, device, dtype):
     from transformers import AutoModelForCausalLM, Qwen3Config
 
-    from vllm.model.qwen3 import Qwen3ForCausalLM
-    from vllm.utils.loader import load_model
+    from minivllm.model.qwen3 import Qwen3ForCausalLM
+    from minivllm.utils.loader import load_model
 
     ref = AutoModelForCausalLM.from_pretrained(path, dtype=dtype).to(device).eval()
 
@@ -26,7 +26,7 @@ def build(path, device, dtype):
 
 
 def our_logits(model, token_ids, device):
-    from vllm.utils.context import reset_context, set_context
+    from minivllm.utils.context import reset_context, set_context
 
     cu = torch.tensor([0, token_ids.numel()], dtype=torch.int32, device=device)
     set_context(is_prefill=True, cu_seqlens_q=cu)
