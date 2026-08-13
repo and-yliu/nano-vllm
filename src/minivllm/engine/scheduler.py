@@ -3,14 +3,17 @@ from minivllm.engine.sequence import Sequence, SequenceStatus
 from minivllm.engine.block_manager import BlockManager
 
 class Scheduler:
-    def __init__(self, max_num_seqs: int, max_num_batched_tokens: int, max_cached_blocks: int, block_size: int, eos: int = -1):
+    def __init__(self, max_num_seqs: int, max_num_batched_tokens: int, max_cached_blocks: int, block_size: int, eos: int | list[int] | set[int] = -1):
         self.waiting: deque[Sequence] = deque()                                          # arrival order
         self.running: deque[Sequence] = deque()                                          # currently holding blocks
         self.block_manager: BlockManager = BlockManager(max_cached_blocks, block_size)
         self.block_size: int = block_size                                                # tokens per KV block
         self.max_num_seqs: int = max_num_seqs                                            # batch width cap
         self.max_num_batched_tokens: int = max_num_batched_tokens                        # prefill work cap per step
-        self.eos_token_id: int = eos
+        # A model can declare several stop tokens
+        self.stop_token_ids: set[int] = (
+            {eos} if isinstance(eos, int) else set(eos)
+        )
 
     # add a seq to waiting queue
     def add(self, seq: Sequence):
@@ -59,19 +62,9 @@ class Scheduler:
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
 
-            # Prefill is all-or-nothing: the runner computes the whole uncached
-            # suffix in one pass, so a seq that does not fit in what is left of
-            # the budget waits for a step of its own. Scheduling it partially
-            # would leave it at the head of `waiting` with nothing to advance it.
-            # add() has already rejected seqs that can never fit, so breaking
-            # here always makes progress on some later step.
             if remaining < num_tokens:
                 break
 
-            # allocate the blocks; this also advances seq.num_cached_tokens over
-            # whatever the prefix cache hit. can_allocate only matches *full*
-            # blocks and never the last one, so at least one token is always
-            # left for this pass to compute.
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
 
@@ -136,10 +129,11 @@ class Scheduler:
     # after process to see if the sequnece should be set to the FINISHED state
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> None:
         for seq, token_id in zip(seqs, token_ids):
+            seq.num_cached_tokens = seq.num_tokens
             seq.append_token(token_id)
 
             # if last_token is end of sentence
-            stop_due_to_eos = not seq.sampling_params.ignore_eos and token_id == self.eos_token_id
+            stop_due_to_eos = not seq.sampling_params.ignore_eos and token_id in self.stop_token_ids
             # if output tokens exceed max_tokens
             stop_due_to_max_tokens = seq.num_output_tokens >= seq.sampling_params.max_tokens
             # if total length exceed max_model_length

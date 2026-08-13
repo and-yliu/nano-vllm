@@ -204,15 +204,12 @@ class ModelRunner:
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids)
 
-        if is_prefill:
-            # Only the last token of each sequence predicts anything. Slice
-            # before the LM head rather than after: logits for every token would
-            # be [total_tokens, vocab] with vocab ~151k, almost all of it thrown
-            # away.
-            seqlens_q = [seq.num_tokens - seq.num_cached_tokens for seq in seqs]
-            last = torch.cumsum(self._to_gpu(seqlens_q, torch.long), dim=0) - 1
-            hidden_states = hidden_states[last]
-
+        # No last-token slice here: ParallelLMHead already does it, using
+        # cu_seqlens_q from the Context, and it slices *before* the vocab matmul
+        # so nothing wide is materialised either way. Doing it in both places
+        # indexes [79, 159, ...] into a tensor that has one row per sequence,
+        # which is an out-of-bounds gather (a device-side assert, reported
+        # asynchronously at whatever CUDA call comes next).
         return self.model.compute_logits(hidden_states)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
