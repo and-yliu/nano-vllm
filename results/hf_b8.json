@@ -1,0 +1,21 @@
+{
+  "backend": "hf",
+  "gpu": "Tesla T4",
+  "model": "Qwen/Qwen3-0.6B",
+  "dtype": "float16",
+  "workload": {
+    "num_seqs": 64,
+    "input_len": 512,
+    "output_len": 128,
+    "prefix_len": 0
+  },
+  "output_tokens": 8192,
+  "prompt_tokens": 32768,
+  "output_tok_s": 121.23232290045112,
+  "total_tok_s": 606.1616145022556,
+  "wall_s": 67.5727380620001,
+  "prefill_s": null,
+  "decode_s": null,
+  "prompt_tokens_computed": 32768,
+  "hf_batch_size": 8
+}

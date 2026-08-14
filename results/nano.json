@@ -1,0 +1,20 @@
+{
+  "backend": "nano",
+  "gpu": "Tesla T4",
+  "model": "Qwen/Qwen3-0.6B",
+  "dtype": "float16",
+  "workload": {
+    "num_seqs": 64,
+    "input_len": 512,
+    "output_len": 128,
+    "prefix_len": 0
+  },
+  "output_tokens": 8192,
+  "prompt_tokens": 32768,
+  "output_tok_s": 560.4157567210559,
+  "total_tok_s": 2802.0787836052796,
+  "wall_s": 14.617718901999979,
+  "prefill_s": 7.897775723999985,
+  "decode_s": 6.719329090999963,
+  "prompt_tokens_computed": 32768
+}
