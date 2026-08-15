@@ -21,8 +21,10 @@ def sample(logits: torch.Tensor, seqs: list[Sequence]) -> list[int]:
         device=logits.device,
     )
 
+    # get the max probable token
     greedy_tokens = logits.argmax(dim=-1)
 
+    # do a multinomial distribution to get the next token, softmax to get each token's probability
     safe_temps = temperatures.clamp_min(1e-5).unsqueeze(-1)
     probs = torch.softmax(logits / safe_temps, dim=-1)
     sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)

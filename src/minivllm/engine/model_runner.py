@@ -30,17 +30,21 @@ class ModelRunner:
             dtype = torch.bfloat16 if major >= 8 else torch.float16
         self.dtype = dtype
 
+        # set block size to config
         config.block_size = block_size
         self.config = config
         self.block_size = block_size
 
+        # set maximum length 
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_model_length = min(
             max_model_length or config.max_position_embeddings,
             config.max_position_embeddings,
         )
 
+        # build the model object
         self.model = Qwen3ForCausalLM(config).to(device=self.device, dtype=self.dtype)
+        # load pretrained model parameter from huggingface
         if path is not None:
             load_model(self.model, path)
         self.model.eval()
@@ -57,23 +61,31 @@ class ModelRunner:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
+        # how many sequence to fill up the max_num_batched_tokens
         num_seqs = max(1, self.max_num_batched_tokens // self.max_model_length)
         seqs = [
             Sequence(token_ids=[0] * self.max_model_length, block_size=self.block_size)
             for _ in range(num_seqs)
         ]
+        # run prefill of a full max_num_batched_tokens run
         self.run(seqs, is_prefill=True)
 
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self, gpu_memory_utilization: float) -> int:
+        # get the total and free amount of gpu memory
         free, total = torch.cuda.mem_get_info(self.device)
+
+        # get current bytes and peak bytes allocated (from the warm up)
         stats = torch.cuda.memory_stats(self.device)
         peak = stats["allocated_bytes.all.peak"]
         current = stats["allocated_bytes.all.current"]
 
+        # (total - free): gpu occupied by other things
+        # (peak - current): gpu occupied peak memory usage during model execution
         available = total * gpu_memory_utilization - (total - free) - (peak - current)
 
+        # layer number, kv heads, head dimensions
         num_layers = self.config.num_hidden_layers
         num_kv_heads = self.config.num_key_value_heads
         head_dim = self.config.head_dim or (
@@ -81,9 +93,11 @@ class ModelRunner:
         )
 
         # 2 = K and V
+        # number of bytes for one block 
         block_bytes = (
             2 * num_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
         )
+        # number of blocks available for this gpu
         num_blocks = int(available) // block_bytes
         assert num_blocks >= 1, (
             f"not enough free memory for even one KV block: {int(available)} bytes "
@@ -102,6 +116,7 @@ class ModelRunner:
         assert len(layers) == num_layers, (
             f"found {len(layers)} Attention modules but config says {num_layers} layers"
         )
+        # assign each layer a chunk of kv cache
         for i, layer in enumerate(layers):
             layer.k_cache = kv_cache[0, i]
             layer.v_cache = kv_cache[1, i]
@@ -111,10 +126,14 @@ class ModelRunner:
 
 
     def _to_gpu(self, data: list, dtype: torch.dtype) -> torch.Tensor:
+        # move tensor from CPU RAM to GPU
+        # pin_memory=True, page lock in physical RAM and enable direct CPU->GPU transfer (Direct memory access)
+        # non_blocking=True, CPU does not wait till the transfer is complete
         return torch.tensor(data, dtype=dtype, pin_memory=True).to(
             self.device, non_blocking=True
         )
 
+    # pad the block table so blocktable have the same length
     def _pad_block_tables(self, seqs: list[Sequence]) -> list[list[int]]:
         max_num_block = max(len(seq.block_table) for seq in seqs)
         return [
@@ -122,6 +141,7 @@ class ModelRunner:
             for seq in seqs
         ]
 
+    # slot index of a block in physical gpu memory 
     def _slots(self, seq: Sequence, start: int, end: int) -> list[int]:
         return [
             seq.block_table[i // self.block_size] * self.block_size + i % self.block_size
@@ -145,19 +165,27 @@ class ModelRunner:
         # block_tables: num_seqs x num_blocks (padded)
         block_tables = []
 
+        # for each sequence 
         for seq in seqs:
             num_cached_tokens = seq.num_cached_tokens
+            # input ids for uncached tokens
             input_ids.extend(seq[num_cached_tokens:])
+            # only count uncached sequence length for q
             seqlens_q.append(seq.num_tokens - num_cached_tokens)
+            # count all sequence length for k
             seqlens_k.append(seq.num_tokens)
+            # calculate cumulative sequence length
             cu_seqlens_q.append(seqlens_q[-1] + cu_seqlens_q[-1])
             cu_seqlens_k.append(seqlens_k[-1] + cu_seqlens_k[-1])
+            # build slot mapping
             if seq.block_table:
                 slot_mappings.extend(self._slots(seq, num_cached_tokens, seq.num_tokens))
 
+        # if any thing hit the cache, if yes, build the block table
         if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
             block_tables = self._pad_block_tables(seqs)
 
+        # initialize context
         set_context(
             is_prefill=True,
             cu_seqlens_q=self._to_gpu(cu_seqlens_q, torch.int32),
@@ -169,6 +197,7 @@ class ModelRunner:
             block_tables=self._to_gpu(block_tables, torch.int32) if block_tables else None,
         )
 
+        # return input_ids
         return self._to_gpu(input_ids, torch.long)
 
 
@@ -178,12 +207,16 @@ class ModelRunner:
         slot_mappings = []
 
         for seq in seqs:
+            # for decode only the last token is needed
             input_ids.append(seq.last_token)
+            # build context lens for each sequence
             context_lens.append(seq.num_tokens)
+            # build slot mapping for just the last token
             slot_mappings.append(
                 seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
             )
 
+        # set context for decode
         set_context(
             is_prefill=False,
             cu_seqlens_q=None,
@@ -202,26 +235,24 @@ class ModelRunner:
     def run_model(
         self, input_ids: torch.Tensor, seqs: list[Sequence], is_prefill: bool
     ) -> torch.Tensor:
+        # calculate model output
         hidden_states = self.model(input_ids)
-
-        # No last-token slice here: ParallelLMHead already does it, using
-        # cu_seqlens_q from the Context, and it slices *before* the vocab matmul
-        # so nothing wide is materialised either way. Doing it in both places
-        # indexes [79, 159, ...] into a tensor that has one row per sequence,
-        # which is an out-of-bounds gather (a device-side assert, reported
-        # asynchronously at whatever CUDA call comes next).
+        # convert output into logits
         return self.model.compute_logits(hidden_states)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         """One engine step: prepare -> forward -> sample."""
+        # get input token ids
         if is_prefill:
             input_ids = self.prepare_prefill(seqs)
         else:
             input_ids = self.prepare_decode(seqs)
 
+        # get logits for each sequence
         logits = self.run_model(input_ids, seqs, is_prefill)
+        # get token ids for each sequence
         token_ids = sample(logits, seqs)
 
-
+        # clear context
         reset_context()
         return token_ids
