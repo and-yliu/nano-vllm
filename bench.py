@@ -57,27 +57,33 @@ def parse_args() -> argparse.Namespace:
 
 def make_prompts(args: argparse.Namespace, vocab_size: int) -> list[list[int]]:
     rng = random.Random(args.seed)
-    # Stay off the special-token ids at the bottom of the vocab; they are
-    # untypical inputs and some are reserved.
+    # try to stay off the special token ids
     lo, hi = 100, vocab_size - 1
 
     assert args.prefix_len <= args.input_len, "--prefix-len exceeds --input-len"
+    # prefix is the one that cache would hit, same for each sequence
     prefix = [rng.randint(lo, hi) for _ in range(args.prefix_len)]
+    # suffix is the one that is different for each sequence
     suffix_len = args.input_len - args.prefix_len
     return [prefix + [rng.randint(lo, hi) for _ in range(suffix_len)] for _ in range(args.num_seqs)]
 
 
 def run(engine: "LLMEngine", prompts: list[list[int]], output_len: int) -> dict:
+    # add different prompt to the engine
     params = SamplingParams(max_tokens=output_len, ignore_eos=True)
     for prompt in prompts:
         engine.add_request(prompt, params)
 
+    # stats to measure performance
     stats = {"prefill_s": 0.0, "decode_s": 0.0, "prefill_tokens": 0,
              "decode_tokens": 0, "prefill_steps": 0, "decode_steps": 0}
 
+    # wait for all kernel to complete
     torch.cuda.synchronize()
     start = time.perf_counter()
+
     while engine.has_work():
+        # one step, prefill or decode
         step_start = time.perf_counter()
         engine.step()
         # step() ends in a device->host copy of the sampled ids, so the GPU work
@@ -96,28 +102,39 @@ def run(engine: "LLMEngine", prompts: list[list[int]], output_len: int) -> dict:
 
 def report(args: argparse.Namespace, stats: dict) -> None:
     prompt_tokens = args.num_seqs * args.input_len
-    output_tokens = args.num_seqs * args.output_len
+    # prefill_tokens are the token processed by engine in the prompt and not in the prefix cache.
+    cached = prompt_tokens - stats["prefill_tokens"]
     # The first token of each sequence comes out of the prefill step, so decode
     # steps produce output_len - 1 each.
-    cached = prompt_tokens - stats["prefill_tokens"]
+    output_tokens = args.num_seqs * args.output_len
 
     def rate(n: int, seconds: float) -> str:
         return f"{n / seconds:,.0f} tok/s" if seconds > 0 else "n/a"
 
     print()
+    # model
     print(f"model            {args.model}")
+
+    # workload, number of sequence, input and output lengths
     print(f"workload         {args.num_seqs} seqs x {args.input_len} in / {args.output_len} out"
           + (f", {args.prefix_len} shared prefix" if args.prefix_len else ""))
+    # limits of the model
     print(f"limits           block_size={args.block_size} max_num_seqs={args.max_num_seqs} "
           f"max_num_batched_tokens={args.max_num_batched_tokens}")
     print("-" * 72)
+
+    # prefill/decode speed
     print(f"prefill          {stats['prefill_tokens']:>9,} tok in {stats['prefill_s']:6.2f}s  "
           f"{rate(stats['prefill_tokens'], stats['prefill_s']):>14}   ({stats['prefill_steps']} steps)")
     print(f"decode           {stats['decode_tokens']:>9,} tok in {stats['decode_s']:6.2f}s  "
           f"{rate(stats['decode_tokens'], stats['decode_s']):>14}   ({stats['decode_steps']} steps)")
+
+    # how many ms per decode step
     if stats["decode_steps"]:
         print(f"decode step      {stats['decode_s'] / stats['decode_steps'] * 1000:.2f} ms mean "
               f"({stats['decode_tokens'] / stats['decode_steps']:.1f} seqs/step)")
+
+    # cache hit percent
     if cached > 0:
         print(f"prefix cache     {cached:,} of {prompt_tokens:,} prompt tokens served from cache "
               f"({cached / prompt_tokens:.0%})")
@@ -125,9 +142,18 @@ def report(args: argparse.Namespace, stats: dict) -> None:
         # Preempted sequences are re-prefilled from scratch, so more prompt
         # tokens were computed than exist. Means the KV cache is too small for
         # this batch: lower --num-seqs or raise --gpu-memory-utilization.
+
+        # 1. Sequences run fine, generating tokens, blocks filling up
+        # 2. One needs a new block → none free
+        # 3. The newest running sequence is evicted, its blocks freed
+        # 4. The blocked sequence proceeds with the freed block
+        # 5. The evicted one re-prefills from scratch later → prefill_tokens exceeds prompt_tokens → cached goes negative
         print(f"preemption       {-cached:,} extra prompt tokens recomputed "
               f"({-cached / prompt_tokens:.0%} over) -- KV cache is oversubscribed")
+        
     print("-" * 72)
+
+    # total time
     print(f"total            {stats['wall_s']:.2f}s wall, "
           f"{output_tokens / stats['wall_s']:,.0f} output tok/s, "
           f"{(stats['prefill_tokens'] + stats['decode_tokens']) / stats['wall_s']:,.0f} tok/s counting prefill")
@@ -144,11 +170,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
     # Warmup prefills max_model_len tokens in one pass and that peak is what
     # sizes the KV cache, so leaving this at the model default (40k for Qwen3)
-    # both wastes startup time and shrinks the cache.
+    # both wastes startup time and shrinks the cache (because peak usage is higher).
     max_model_len = args.max_model_len or (args.input_len + args.output_len)
 
     print(f"loading {args.model} ...")
     load_start = time.perf_counter()
+    # create the engine object, get the kv cache available and more.
     engine = LLMEngine(
         args.model,
         block_size=args.block_size,
@@ -161,13 +188,16 @@ def main() -> None:
           f"{engine.runner.num_blocks:,} KV blocks "
           f"({engine.runner.num_blocks * args.block_size:,} tokens)")
 
+    # get generate prompts
     prompts = make_prompts(args, engine.runner.config.vocab_size)
 
+    # let the engine warm up
     if args.warmup:
         rng = random.Random(args.seed + 1)
         vocab = engine.runner.config.vocab_size
         run(engine, [[rng.randint(100, vocab - 1) for _ in range(64)] for _ in range(2)], output_len=4)
 
+    # actual run and report
     report(args, run(engine, prompts, args.output_len))
 
 

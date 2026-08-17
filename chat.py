@@ -41,35 +41,20 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_prompt(tokenizer, messages: list[dict], think: bool) -> list[int]:
-    """Render the conversation with the model's chat template -> token ids.
-
-    transformers 5 returns a BatchEncoding here by default, not a list of ids.
-    Iterating that yields its string keys, so it has to be unwrapped -- the
-    failure mode otherwise is a confusing "too many dimensions 'str'" much later.
-    """
-    kwargs = dict(add_generation_prompt=True, tokenize=True, return_dict=False)
-    try:
-        out = tokenizer.apply_chat_template(messages, enable_thinking=think, **kwargs)
-    except TypeError:
-        # Template or transformers version without one of these kwargs.
-        kwargs.pop("return_dict", None)
-        try:
-            out = tokenizer.apply_chat_template(messages, enable_thinking=think, **kwargs)
-        except TypeError:
-            out = tokenizer.apply_chat_template(messages, **kwargs)
-
-    if hasattr(out, "keys"):          # BatchEncoding / dict
-        out = out["input_ids"]
-    if out and isinstance(out[0], list):   # batched shape [1, seq]
-        out = out[0]
-    return list(out)
+    # Render the conversation with the model's chat template -> as a flat list token ids.
+    return tokenizer.apply_chat_template(
+        messages, enable_thinking=think,
+        add_generation_prompt=True, tokenize=True, return_dict=False,
+    )
 
 
 def stream_reply(engine, prompt_ids: list[int], params: SamplingParams) -> tuple[str, dict]:
-    """Run one request to completion, printing tokens as they are produced."""
+    # Run one request to completion, printing tokens as they are produced.
+    # add reuqest to engine
     seq_id = engine.add_request(prompt_ids, params)
     seq = engine.requests[seq_id]
 
+    # performance variable
     shown = 0          # characters already printed
     prefill_s = 0.0
     decode_s = 0.0
@@ -81,6 +66,7 @@ def stream_reply(engine, prompt_ids: list[int], params: SamplingParams) -> tuple
     while engine.has_work():
         step_start = time.perf_counter()
         try:
+            # run a step of the engine, do a prefill or decode batche
             finished = engine.step()
         except KeyboardInterrupt:
             # Retire the request by hand so the engine does not keep decoding it
@@ -98,26 +84,29 @@ def stream_reply(engine, prompt_ids: list[int], params: SamplingParams) -> tuple
         elapsed = time.perf_counter() - step_start
 
         if engine.last_step_is_prefill:
+            # add time
             prefill_s += elapsed
-            # Must be read here, not at the end: postprocess advances
-            # num_cached_tokens every step, so by the time the reply is done it
-            # equals the full sequence length and says nothing about the cache.
-            # last_step_num_tokens already excludes whatever the cache served.
+            # number of cache token hits, how many token is sent minus how many token the engine processed
             cached_tokens = len(prompt_ids) - engine.last_step_num_tokens
         else:
             decode_s += elapsed
 
+        # get output tokens
         text = engine.tokenizer.decode(seq.output_token_ids, skip_special_tokens=True)
         if len(text) > shown:
+            # get time to generate first token 
             if first_token_s is None:
                 first_token_s = time.perf_counter() - start
+            # print text in stream, each step only generate the next token
             print(text[shown:], end="", flush=True)
             shown = len(text)
 
+        # if finished stop loop
         if any(f.seq_id == seq_id for f in finished):
             break
 
     print()
+    # return generate text and stats
     text = engine.tokenizer.decode(seq.output_token_ids, skip_special_tokens=True)
     stats = {
         "prompt_tokens": len(prompt_ids),
@@ -140,6 +129,7 @@ def main() -> None:
 
     print(f"loading {args.model} ...")
     t0 = time.perf_counter()
+    # build engine
     engine = LLMEngine(
         args.model,
         block_size=args.block_size,
@@ -151,6 +141,7 @@ def main() -> None:
           f"{engine.runner.num_blocks * args.block_size:,} tokens)")
     print("commands: /reset  /stats  /exit\n")
 
+    # sampling parameters
     params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
     messages: list[dict] = []
     if args.system:
@@ -160,21 +151,26 @@ def main() -> None:
               "prefill_s": 0.0, "decode_s": 0.0, "turns": 0}
 
     while True:
+        # get user inputs
         try:
             user = input("\033[1muser>\033[0m ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
 
+        # inputs of different command
         if not user:
             continue
         if user in ("/exit", "/quit"):
+            # quit
             break
         if user == "/reset":
+            # clear history
             messages = [m for m in messages if m["role"] == "system"]
             print("history cleared\n")
             continue
         if user == "/stats":
+            # stats
             t = totals
             if t["turns"]:
                 hit = t["cached_tokens"] / t["prompt_tokens"] if t["prompt_tokens"] else 0
@@ -190,9 +186,12 @@ def main() -> None:
             print()
             continue
 
+        # add user message to history
         messages.append({"role": "user", "content": user})
+        # build the prompt to input to engine
         prompt_ids = build_prompt(engine.tokenizer, messages, args.think)
 
+        # check if the response will exceed the model's context
         if len(prompt_ids) + args.max_tokens > args.max_model_len:
             print(f"  conversation too long ({len(prompt_ids)} tokens); /reset or raise "
                   f"--max-model-len\n")
@@ -200,13 +199,16 @@ def main() -> None:
             continue
 
         print("\033[1massistant>\033[0m ", end="", flush=True)
+        # get generated text and token through running the engine
         reply, stats = stream_reply(engine, prompt_ids, params)
         messages.append({"role": "assistant", "content": reply})
 
+        # cumulate stats
         for k in ("prompt_tokens", "cached_tokens", "output_tokens", "prefill_s", "decode_s"):
             totals[k] += stats[k]
         totals["turns"] += 1
 
+        # token generation speed (tok/s) in decode
         rate = stats["output_tokens"] / stats["decode_s"] if stats["decode_s"] else 0
         print(f"\033[2m  {stats['output_tokens']} tok, "
               f"ttft {stats['ttft_s'] * 1000:.0f}ms, {rate:,.1f} tok/s\033[0m\n")
