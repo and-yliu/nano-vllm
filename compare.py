@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Same workload, three backends, one number each.
 
-    python compare.py --backend nano --out results/nano.json
+    python compare.py --backend mini --out results/mini.json
     python compare.py --backend hf   --out results/hf.json
     python compare.py --backend vllm --out results/vllm.json     # see note below
     python compare.py --compare results/*.json
@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parent
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--backend", choices=["nano", "hf", "vllm"])
+    p.add_argument("--backend", choices=["mini", "hf", "vllm"])
     p.add_argument("--compare", nargs="+", metavar="JSON", help="print a table from result files")
     p.add_argument("--out", default=None, help="where to write the result json")
 
@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+# same as bench.py, generate randomized prompts
 def make_prompts(args) -> list[list[int]]:
     """Random token ids, so results do not depend on any tokenizer's quirks."""
     rng = random.Random(args.seed)
@@ -61,14 +62,15 @@ def make_prompts(args) -> list[list[int]]:
 
 
 # ---------------------------------------------------------------- backends
-
-def run_nano(args, prompts) -> dict:
+# run this project inference engine
+def run_mini(args, prompts) -> dict:
     import sys
     sys.path.insert(0, str(ROOT / "src"))
     import torch
     from minivllm.engine.llm_engine import LLMEngine
     from minivllm.sampling_params import SamplingParams
 
+    # build engine object
     engine = LLMEngine(
         args.model,
         block_size=args.block_size,
@@ -80,9 +82,11 @@ def run_nano(args, prompts) -> dict:
     )
     params = SamplingParams(temperature=1e-6, max_tokens=args.output_len, ignore_eos=True)
 
+    # add all generated prompts 
     for prompt in prompts:
         engine.add_request(prompt, params)
 
+    # performance metrix as we step through engine
     prefill_s = decode_s = 0.0
     prefill_tokens = 0
     torch.cuda.synchronize()
@@ -102,23 +106,24 @@ def run_nano(args, prompts) -> dict:
     return {"wall_s": wall, "prefill_s": prefill_s, "decode_s": decode_s,
             "prompt_tokens_computed": prefill_tokens}
 
-
+# run huggingface engine
 def run_hf(args, prompts) -> dict:
     import torch
     from transformers import AutoModelForCausalLM
     from huggingface_hub import snapshot_download
 
+    # load huggingface model
     path = snapshot_download(args.model)
     model = AutoModelForCausalLM.from_pretrained(
         path, dtype=getattr(torch, args.dtype)
     ).cuda().eval()
 
+    # measure performance
     torch.cuda.synchronize()
     start = time.perf_counter()
+    # hf kv cache is [batch, kv_heads, seq, head_dim], need to control kv cache usage through hf_batch_size
     for i in range(0, len(prompts), args.hf_batch_size):
         chunk = prompts[i:i + args.hf_batch_size]
-        # Prompts are all the same length here, so no padding is needed and HF
-        # is not penalised for padded positions.
         input_ids = torch.tensor(chunk, dtype=torch.long, device="cuda")
         with torch.inference_mode():
             model.generate(
@@ -135,11 +140,12 @@ def run_hf(args, prompts) -> dict:
             "prompt_tokens_computed": args.num_seqs * args.input_len,
             "hf_batch_size": args.hf_batch_size}
 
-
+# run vllm engine
 def run_vllm(args, prompts) -> dict:
     import torch
     from vllm import LLM, SamplingParams as VLLMSamplingParams
 
+    # create vllm model
     llm = LLM(
         model=args.model,
         dtype=args.dtype,
@@ -150,6 +156,7 @@ def run_vllm(args, prompts) -> dict:
     )
     params = VLLMSamplingParams(temperature=0.0, max_tokens=args.output_len, ignore_eos=True)
 
+    # measure engine performace
     torch.cuda.synchronize()
     start = time.perf_counter()
     llm.generate(prompt_token_ids=prompts, sampling_params=params, use_tqdm=False)
@@ -169,7 +176,7 @@ def gpu_name() -> str:
     except Exception:
         return "unknown"
 
-
+# write one engine result to a json file
 def report_one(args, result: dict) -> dict:
     out_tokens = args.num_seqs * args.output_len
     prompt_tokens = args.num_seqs * args.input_len
@@ -200,7 +207,7 @@ def report_one(args, result: dict) -> dict:
             print(f"  prefix cache  {served:,}/{prompt_tokens:,} prompt tokens served ({served/prompt_tokens:.0%})")
     return record
 
-
+# compare results from different engine in the json file
 def do_compare(paths: list[str]) -> None:
     records = [json.loads(Path(p).read_text()) for p in paths]
     records.sort(key=lambda r: -r["output_tok_s"])
@@ -229,10 +236,10 @@ def main() -> None:
         do_compare(args.compare)
         return
     if not args.backend:
-        raise SystemExit("pass --backend {nano,hf,vllm} or --compare FILES")
+        raise SystemExit("pass --backend {mini,hf,vllm} or --compare FILES")
 
     prompts = make_prompts(args)
-    runner = {"nano": run_nano, "hf": run_hf, "vllm": run_vllm}[args.backend]
+    runner = {"mini": run_mini, "hf": run_hf, "vllm": run_vllm}[args.backend]
 
     print(f"running backend={args.backend} ...")
     record = report_one(args, runner(args, prompts))
